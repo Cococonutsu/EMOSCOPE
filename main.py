@@ -70,7 +70,8 @@ def run_dataset(model, processor, name: str, limit: int | None, bs: int,
         rows = rows[:limit]
     question = classify_prompt(labels)
     prompt = f"USER: <image>\n{question} ASSISTANT:"
-    if keep and ((localizer is None and not random) or ensemble_alpha is not None):
+    if keep and ((localizer is None and not random) or ensemble_alpha is not None
+                 or (localizer is not None and getattr(localizer, "use_cls", False))):
         enable_layer_attention(model)  # CLS 参与打分时取注意力；纯头/随机不需要
 
     # 断点续跑：读已有记录跳过完成样本，结果逐批追加落盘（中断后重跑不重来）
@@ -173,6 +174,8 @@ def main() -> None:
                          "ensemble=头+CLS加权（需 --localizer 和 --alpha）")
     ap.add_argument("--alpha", type=float, default=0.5,
                     help="ensemble 中定位头的权重（CLS 为 1-alpha）")
+    ap.add_argument("--cls-feat", action="store_true",
+                    help="定位头为融合版（输入含 CLS 特征），加载与推理时启用")
     ap.add_argument("--seed", type=int, default=0,
                     help="random 打分器的抽样种子（多seed检验方差用）")
     args = ap.parse_args()
@@ -187,7 +190,7 @@ def main() -> None:
     localizer = None
     if args.localizer:
         from emoscope.localizer import EvidenceLocalizer
-        localizer = EvidenceLocalizer().to(model.device)
+        localizer = EvidenceLocalizer(use_cls=args.cls_feat).to(model.device)
         localizer.load_state_dict(torch.load(args.localizer,
                                              map_location=model.device))
         localizer.eval()

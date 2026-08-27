@@ -29,6 +29,7 @@ from tqdm import tqdm
 from emoscope.datasets import emoset_boxes
 from emoscope.llava import load_llava
 from emoscope.localizer import GRID, EvidenceLocalizer, patch_targets
+from emoscope.prune import enable_layer_attention
 
 QUESTION = ("You are given an image and must infer its emotional category.\n"
             "Answer with one word from: amusement, anger, awe, contentment, "
@@ -42,9 +43,14 @@ def build_batch(model, processor, localizer, chunk, device):
                                    return_tensors="pt")["pixel_values"]
     px = px.to(device, torch.bfloat16)
     with torch.no_grad():
-        feats = model.model.vision_tower(px, output_hidden_states=True)\
-                  .hidden_states[-2][:, 1:]                     # (B,576,1024)
-    s = localizer(feats.float())                                # 证据分数 logits
+        vis = model.model.vision_tower(px, output_hidden_states=True,
+                                       output_attentions=localizer.use_cls)
+        feats = vis.hidden_states[-2][:, 1:]                     # (B,576,1024)
+        cls_score = None
+        if localizer.use_cls:  # 融合头需要 CLS 特征（单层 eager 已开启）
+            a = next(a for a in vis.attentions if a is not None)
+            cls_score = a.mean(dim=1)[:, 0, 1:].float()          # (B,576)
+    s = localizer(feats.float(), cls_score)                      # 证据分数 logits
     m = torch.sigmoid(s)                                        # 软掩码
     with torch.no_grad():
         emb = model.model.multi_modal_projector(feats)          # (B,576,4096)
@@ -97,6 +103,8 @@ def main() -> None:
     ap.add_argument("--teacher", default=None,
                     help="老师热图缓存 pt（可选，配合 --heads）")
     ap.add_argument("--lambda-distill", type=float, default=0.0)
+    ap.add_argument("--use-cls", action="store_true",
+                    help="训练级融合：输入拼接 CLS 注意力分数")
     ap.add_argument("--out", default="checkpoints/localizer.pt")
     args = ap.parse_args()
 
@@ -108,8 +116,10 @@ def main() -> None:
 
     model, processor = load_llava()
     model.requires_grad_(False)
+    if args.use_cls:
+        enable_layer_attention(model)  # 融合头训练需 CLS 注意力（单层 eager）
     device = model.device
-    localizer = EvidenceLocalizer().to(device)
+    localizer = EvidenceLocalizer(use_cls=args.use_cls).to(device)
     opt = torch.optim.AdamW(localizer.parameters(), lr=args.lr)
 
     def run_batches(data, train, epoch, log_f):

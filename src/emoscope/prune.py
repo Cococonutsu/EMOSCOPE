@@ -87,9 +87,18 @@ def generate_pruned(model, processor, images: list, prompt: str, keep_pct: float
         s_head = localizer(feats.float())
         scores = ensemble_alpha * _z(s_head) + (1 - ensemble_alpha) * _z(s_cls)
     elif localizer is not None:
-        feats = model.model.vision_tower(px, output_hidden_states=True)\
-                  .hidden_states[-2][:, 1:]                 # (B,576,1024)
-        scores = localizer(feats.float())                   # (B,576)
+        if getattr(localizer, "use_cls", False):
+            # 融合头：一次前向同取特征与 CLS 注意力（单层 eager 已开启）
+            vis = model.model.vision_tower(px, output_hidden_states=True,
+                                           output_attentions=True)
+            feats = vis.hidden_states[-2][:, 1:]
+            a = next(a for a in vis.attentions if a is not None)
+            s_cls = a.mean(dim=1)[:, 0, 1:]
+            scores = localizer(feats.float(), s_cls.float())
+        else:
+            feats = model.model.vision_tower(px, output_hidden_states=True)\
+                      .hidden_states[-2][:, 1:]                 # (B,576,1024)
+            scores = localizer(feats.float())                   # (B,576)
     else:
         feats, scores = vision_feats_scores(model, px)
     feats = model.model.multi_modal_projector(feats)         # (B,576,4096)

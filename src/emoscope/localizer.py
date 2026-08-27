@@ -15,10 +15,16 @@ CLIP_SIZE = 336  # CLIP 输入边长
 
 
 class EvidenceLocalizer(nn.Module):
-    """patch 特征 (B,576,1024) -> 证据分数 logits (B,576)。"""
+    """patch 特征 (B,576,1024) -> 证据分数 logits (B,576)。
 
-    def __init__(self, in_dim: int = 1024, hid: int = 256):
+    use_cls=True 时输入额外拼接 CLS 注意力分数（B,576,1025），训练级融合：
+    头逐图学习在显著先验（CLS）与证据知识之间分配权重。
+    """
+
+    def __init__(self, in_dim: int = 1024, hid: int = 256, use_cls: bool = False):
         super().__init__()
+        self.use_cls = use_cls
+        in_dim = in_dim + 1 if use_cls else in_dim
         self.pos = nn.Parameter(torch.zeros(1, GRID * GRID, in_dim))
         nn.init.trunc_normal_(self.pos, std=0.02)
         self.mlp = nn.Sequential(
@@ -27,7 +33,11 @@ class EvidenceLocalizer(nn.Module):
             nn.Linear(hid // 4, 1),
         )
 
-    def forward(self, feats: torch.Tensor) -> torch.Tensor:
+    def forward(self, feats: torch.Tensor,
+                cls_score: torch.Tensor | None = None) -> torch.Tensor:
+        if self.use_cls:
+            assert cls_score is not None, "use_cls 头需要 CLS 注意力分数"
+            feats = torch.cat([feats, cls_score.unsqueeze(-1)], dim=-1)
         return self.mlp(feats + self.pos).squeeze(-1)
 
 
