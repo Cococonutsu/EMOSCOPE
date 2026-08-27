@@ -109,15 +109,12 @@ def main() -> None:
     ap.add_argument("--out", default="checkpoints/localizer.pt")
     args = ap.parse_args()
 
-    train_rows = load_jsonl(DATA_DIR / "train_emoset.jsonl")[:args.n]
-    val_rows = load_jsonl(DATA_DIR / "val_emoset.jsonl")[:args.val]
-    extra = []
     if args.mix:
-        for name in ("train_artemis.jsonl", "train_emotionroi.jsonl"):
-            extra += load_jsonl(DATA_DIR / name)
-        train_rows = train_rows + extra
-        random.Random(1).shuffle(train_rows)  # 三源全局交错，固定种子可复现
-    print(f"训练 {len(train_rows)} 条（emoset {args.n} + 混域 {len(extra)}）")
+        train_rows = load_jsonl(DATA_DIR / "train_mix.jsonl")  # 全量，--n 仅用于emoset单源路径
+        print(f"训练 {len(train_rows)} 条（三源已合并打乱：dataset/train_mix.jsonl）")
+    else:
+        train_rows = load_jsonl(DATA_DIR / "train_emoset.jsonl")[:args.n]
+    val_rows = load_jsonl(DATA_DIR / "val_emoset.jsonl")[:args.val]
 
     model, processor = load_llava()
     model.requires_grad_(False)
