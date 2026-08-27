@@ -62,15 +62,16 @@ def parse_pred(text: str, labels: list[str]) -> str | None:
 @torch.no_grad()
 def run_dataset(model, processor, name: str, limit: int | None, bs: int,
                  model_name: str, keep: float | None = None,
-                 localizer=None, random: bool = False) -> None:
+                 localizer=None, random: bool = False,
+                 ensemble_alpha: float | None = None) -> None:
     labels = LABEL_SETS[name]
     rows = DATASET_LOADERS[name].load()
     if limit:
         rows = rows[:limit]
     question = classify_prompt(labels)
     prompt = f"USER: <image>\n{question} ASSISTANT:"
-    if keep and localizer is None and not random:
-        enable_layer_attention(model)  # CLS 打分：仅倒数第二层 eager，其余层保持 sdpa
+    if keep and ((localizer is None and not random) or ensemble_alpha is not None):
+        enable_layer_attention(model)  # CLS 参与打分时取注意力；纯头/随机不需要
 
     # 断点续跑：读已有记录跳过完成样本，结果逐批追加落盘（中断后重跑不重来）
     out_dir = Path(__file__).parent / "results" / model_name
@@ -95,9 +96,10 @@ def run_dataset(model, processor, name: str, limit: int | None, bs: int,
         for i in tqdm(range(0, len(rows), bs), desc=name):
             chunk = rows[i : i + bs]
             images = [Image.open(r["path"]).convert("RGB") for r in chunk]
-            if keep:  # 剪枝生成（随机/定位头/CLS 三种打分；传裸问题，模板在内拼）
+            if keep:  # 剪枝生成（随机/定位头/CLS/集成打分；传裸问题，模板在内拼）
                 gens = generate_pruned(model, processor, images, question, keep,
-                                       localizer=localizer, random=random)
+                                       localizer=localizer, random=random,
+                                       ensemble_alpha=ensemble_alpha)
             else:
                 inputs = processor(images=images, text=[prompt] * len(chunk),
                                    return_tensors="pt", padding=True).to(
@@ -165,13 +167,19 @@ def main() -> None:
                     help="剪枝：保留视觉 token 的百分比（0-100，100=不剪）")
     ap.add_argument("--localizer", default=None, metavar="CKPT",
                     help="证据定位头 checkpoint，替代 CLS 注意力打分")
-    ap.add_argument("--scorer", choices=["cls", "random"], default="cls",
-                    help="打分器：cls=CLS注意力（默认），random=随机保留（对照）")
+    ap.add_argument("--scorer", choices=["cls", "random", "ensemble"],
+                    default="cls",
+                    help="打分器：cls=CLS注意力（默认），random=随机对照，"
+                         "ensemble=头+CLS加权（需 --localizer 和 --alpha）")
+    ap.add_argument("--alpha", type=float, default=0.5,
+                    help="ensemble 中定位头的权重（CLS 为 1-alpha）")
     ap.add_argument("--seed", type=int, default=0,
                     help="random 打分器的抽样种子（多seed检验方差用）")
     args = ap.parse_args()
     if not args.image and not args.dataset:
         ap.error("需要 --image 或 --dataset 之一")
+    if args.scorer == "ensemble" and not args.localizer:
+        ap.error("ensemble 打分需要 --localizer")
 
     model, processor = load_llava()
     if args.scorer == "random":
@@ -185,17 +193,25 @@ def main() -> None:
         localizer.eval()
     model_name = args.model_name
     if args.keep and args.model_name == "llava1.5-base":  # 剪枝结果另存目录
-        base = (f"llava1.5-{Path(args.localizer).stem}" if localizer else
-                "llava1.5-random" if args.scorer == "random" else "llava1.5-prune")
+        ckpt = Path(args.localizer).stem.removeprefix("localizer_") if args.localizer else ""
+        if args.scorer == "ensemble":
+            base = f"llava1.5-ens{args.alpha:g}-{ckpt}"
+        elif localizer is not None:
+            base = f"llava1.5-{Path(args.localizer).stem}"
+        elif args.scorer == "random":
+            base = "llava1.5-random"
+        else:
+            base = "llava1.5-prune"
         if args.scorer == "random":
-            base += f"-keep{args.keep:g}pct_{args.seed}"  # seed 后缀必带
-            model_name = base
+            model_name = f"{base}-keep{args.keep:g}pct_{args.seed}"  # seed 后缀必带
         else:
             model_name = f"{base}-keep{args.keep:g}pct"
     if args.dataset:
         run_dataset(model, processor, args.dataset, args.limit, args.bs,
                    model_name, keep=args.keep, localizer=localizer,
-                   random=args.scorer == "random")
+                   random=args.scorer == "random",
+                   ensemble_alpha=(args.alpha if args.scorer == "ensemble"
+                                   and args.keep else None))
     else:
         run_single(model, processor, args.image, args.prompt, keep=args.keep)
 

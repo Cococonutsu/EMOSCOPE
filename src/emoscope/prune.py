@@ -48,15 +48,22 @@ def vision_feats_scores(model, pixel_values) -> tuple[torch.Tensor, torch.Tensor
     return feats, scores
 
 
+def _z(s: torch.Tensor) -> torch.Tensor:
+    """图内标准化：头 logits 与 CLS 注意力（和为1）尺度对齐后才能加权。"""
+    return (s - s.mean(-1, keepdim=True)) / (s.std(-1, keepdim=True) + 1e-6)
+
+
 @torch.no_grad()
 def generate_pruned(model, processor, images: list, prompt: str, keep_pct: float,
                     max_new_tokens: int = 16, localizer=None,
-                    random: bool = False) -> list[str]:
+                    random: bool = False, ensemble_alpha: float | None = None
+                    ) -> list[str]:
     """对一批同模板图片剪枝视觉 token 后生成，返回每张图的回答文本。
 
     keep_pct 为保留 token 的百分比（0-100），内部换算成个数。
-    分数来源三选一：random=均匀随机（零信息对照）；localizer=证据定位头；
-    默认 CLS 注意力（须先 enable_vision_attention）。
+    分数来源：random=均匀随机（零信息对照）；localizer=证据定位头；
+    localizer+ensemble_alpha=头与CLS按图内标准化后加权（alpha 归头）；
+    默认 CLS 注意力。除默认外均须先 enable_layer_attention 或不需要注意力。
     """
     device = model.device
     bsz = len(images)
@@ -70,6 +77,15 @@ def generate_pruned(model, processor, images: list, prompt: str, keep_pct: float
         feats = model.model.vision_tower(px, output_hidden_states=True)\
                   .hidden_states[-2][:, 1:]                 # (B,576,1024)
         scores = torch.rand(bsz, 576, device=device)        # 零信息对照
+    elif localizer is not None and ensemble_alpha is not None:
+        # 集成：单层 eager 已开启，一次前向同取特征与 CLS 注意力
+        vis = model.model.vision_tower(px, output_hidden_states=True,
+                                       output_attentions=True)
+        feats = vis.hidden_states[-2][:, 1:]
+        a = next(a for a in vis.attentions if a is not None)
+        s_cls = a.mean(dim=1)[:, 0, 1:]                     # (B,576)
+        s_head = localizer(feats.float())
+        scores = ensemble_alpha * _z(s_head) + (1 - ensemble_alpha) * _z(s_cls)
     elif localizer is not None:
         feats = model.model.vision_tower(px, output_hidden_states=True)\
                   .hidden_states[-2][:, 1:]                 # (B,576,1024)
