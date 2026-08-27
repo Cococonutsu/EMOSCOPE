@@ -207,9 +207,9 @@ def main() -> None:
                              gn=f"{grad_norm:.2f}",
                              iou=f"{hit / len(chunk):.3f}",
                              kept=f"{m.sum(-1).mean().item():.0f}")
-            # 每10步落一行训练日志，供事后检查训练是否健康
+            # 每批日志落在优化器更新步上（间隔=累积数的倍数），gn 行行有值
             step = tot["n"]
-            if train and step % 10 == 0:
+            if train and step % (args.accum * 2) == 0:
                 log_f.write(json.dumps({
                     "phase": "train", "epoch": epoch, "step": step,
                     "ce": round(out.loss.item(), 4), "box": round(l_box.item(), 4),
