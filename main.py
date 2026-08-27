@@ -195,7 +195,9 @@ def main() -> None:
         from emoscope.localizer import EvidenceLocalizer
         localizer = EvidenceLocalizer(use_cls=args.cls_feat).to(model.device)
         state = torch.load(args.localizer, map_location=model.device)
-        state.pop("blend_alpha", None)  # alpha 单独存于 .alpha.json，不属模型权重
+        # blend 参数（alpha/gamma）单独存于 .alpha.json 元信息，不属模型权重
+        for k in [k for k in state if k.startswith("blend_")]:
+            state.pop(k)
         localizer.load_state_dict(state)
         localizer.eval()
         if args.blend_head:
