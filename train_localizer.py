@@ -115,8 +115,8 @@ def main() -> None:
     if args.mix:
         for name in ("train_artemis.jsonl", "train_emotionroi.jsonl"):
             extra += load_jsonl(DATA_DIR / name)
-        random.Random(1).shuffle(extra)
-        train_rows = train_rows + extra  # 混域交错，固定种子可复现
+        train_rows = train_rows + extra
+        random.Random(1).shuffle(train_rows)  # 三源全局交错，固定种子可复现
     print(f"训练 {len(train_rows)} 条（emoset {args.n} + 混域 {len(extra)}）")
 
     model, processor = load_llava()
