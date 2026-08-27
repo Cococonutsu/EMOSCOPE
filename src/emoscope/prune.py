@@ -50,14 +50,9 @@ def vision_feats_scores(model, pixel_values) -> tuple[torch.Tensor, torch.Tensor
 
 def needs_attention(localizer, random: bool, ensemble_alpha) -> bool:
     """本次推理是否需要取视觉塔注意力（CLS 参与打分的所有情形）。"""
-    if random:
+    if random or (localizer is not None and ensemble_alpha is None):
         return False
-    if localizer is None:
-        return True  # 默认 CLS 打分
-    return (getattr(localizer, "use_cls", False)
-            or getattr(localizer, "blend_alpha", None) is not None
-            or getattr(localizer, "blend_gamma", None) is not None
-            or ensemble_alpha is not None)
+    return True
 
 
 def _z(s: torch.Tensor) -> torch.Tensor:
@@ -75,7 +70,7 @@ def generate_pruned(model, processor, images: list, prompt: str, keep_pct: float
     keep_pct 为保留 token 的百分比（0-100），内部换算成个数。
     分数来源：random=均匀随机（零信息对照）；localizer=证据定位头；
     localizer+ensemble_alpha=头与CLS按图内标准化后加权（alpha 归头）；
-    默认 CLS 注意力。除默认外均须先 enable_layer_attention 或不需要注意力。
+    默认 CLS 注意力。
     """
     device = model.device
     bsz = len(images)
@@ -99,37 +94,9 @@ def generate_pruned(model, processor, images: list, prompt: str, keep_pct: float
         s_head = localizer(feats.float())
         scores = ensemble_alpha * _z(s_head) + (1 - ensemble_alpha) * _z(s_cls)
     elif localizer is not None:
-        if getattr(localizer, "blend_gamma", None) is not None:
-            # 直接相加推理：head + e^γ·cls（γ 取训练学到的尺度）
-            vis = model.model.vision_tower(px, output_hidden_states=True,
-                                           output_attentions=True)
-            feats = vis.hidden_states[-2][:, 1:]
-            a = next(a for a in vis.attentions if a is not None)
-            s_cls = a.mean(dim=1)[:, 0, 1:].float()
-            s_head = localizer(feats.float())
-            scores = s_head + float(localizer.blend_gamma) * s_cls
-        elif getattr(localizer, "blend_alpha", None) is not None:
-            # 分数级加权推理：alpha 取训练学到的系数（标量）
-            vis = model.model.vision_tower(px, output_hidden_states=True,
-                                           output_attentions=True)
-            feats = vis.hidden_states[-2][:, 1:]
-            a = next(a for a in vis.attentions if a is not None)
-            s_cls = a.mean(dim=1)[:, 0, 1:].float()
-            s_head = localizer(feats.float())
-            al = float(localizer.blend_alpha)
-            scores = al * _z(s_head) + (1 - al) * _z(s_cls)
-        elif getattr(localizer, "use_cls", False):
-            # 融合头：一次前向同取特征与 CLS 注意力（单层 eager 已开启）
-            vis = model.model.vision_tower(px, output_hidden_states=True,
-                                           output_attentions=True)
-            feats = vis.hidden_states[-2][:, 1:]
-            a = next(a for a in vis.attentions if a is not None)
-            s_cls = a.mean(dim=1)[:, 0, 1:]
-            scores = localizer(feats.float(), s_cls.float())
-        else:
-            feats = model.model.vision_tower(px, output_hidden_states=True)\
-                      .hidden_states[-2][:, 1:]                 # (B,576,1024)
-            scores = localizer(feats.float())                   # (B,576)
+        feats = model.model.vision_tower(px, output_hidden_states=True)\
+                  .hidden_states[-2][:, 1:]                 # (B,576,1024)
+        scores = localizer(feats.float())                   # (B,576)
     else:
         feats, scores = vision_feats_scores(model, px)
     feats = model.model.multi_modal_projector(feats)         # (B,576,4096)

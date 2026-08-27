@@ -173,12 +173,6 @@ def main() -> None:
                          "ensemble=头+CLS加权（需 --localizer 和 --alpha）")
     ap.add_argument("--alpha", type=float, default=0.5,
                     help="ensemble 中定位头的权重（CLS 为 1-alpha）")
-    ap.add_argument("--cls-feat", action="store_true",
-                    help="定位头为融合版（输入含 CLS 特征），加载与推理时启用")
-    ap.add_argument("--ttt", action="store_true",
-                    help="定位头为 TTT-MLP 版（逐图内环适应）")
-    ap.add_argument("--blend-head", action="store_true",
-                    help="定位头为分数级融合版：按 checkpoint 元信息（alpha/gamma）与CLS混合")
     ap.add_argument("--seed", type=int, default=0,
                     help="random 打分器的抽样种子（多seed检验方差用）")
     args = ap.parse_args()
@@ -193,27 +187,10 @@ def main() -> None:
     localizer = None
     if args.localizer:
         from emoscope.localizer import EvidenceLocalizer
-        if args.ttt:
-            from emoscope.ttt import TTTMLPLocalizer
-            localizer = TTTMLPLocalizer().to(model.device)
-        else:
-            localizer = EvidenceLocalizer(use_cls=args.cls_feat).to(model.device)
-        state = torch.load(args.localizer, map_location=model.device)
-        # blend 参数（alpha/gamma）单独存于 .alpha.json 元信息，不属模型权重
-        for k in [k for k in state if k.startswith("blend_")]:
-            state.pop(k)
-        localizer.load_state_dict(state)
+        localizer = EvidenceLocalizer().to(model.device)
+        localizer.load_state_dict(
+            torch.load(args.localizer, map_location=model.device))
         localizer.eval()
-        if args.blend_head:
-            import json as _json
-            meta = _json.load(open(str(args.localizer)
-                                   .replace(".pt", ".alpha.json")))
-            if "gamma" in meta:
-                localizer.blend_gamma = meta["gamma"]
-                print(f"blend-head: gamma={meta['gamma']}（CLS 尺度，直接相加）")
-            else:
-                localizer.blend_alpha = meta["alpha"]
-                print(f"blend-head: alpha={meta['alpha']}（头权重）[已归档]")
     model_name = args.model_name
     if args.keep and args.model_name == "llava1.5-base":  # 剪枝结果另存目录
         ckpt = Path(args.localizer).stem.removeprefix("localizer_") if args.localizer else ""

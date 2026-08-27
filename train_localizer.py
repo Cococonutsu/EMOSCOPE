@@ -1,14 +1,12 @@
 #!/usr/bin/env python3
-"""证据定位头训练：框监督 BCE + 任务 CE（软掩码直通）+ 预算正则（+可选蒸馏 KL）。
+"""证据定位头训练：框监督 BCE + 任务 CE（软掩码直通）+ 预算正则。
 
-CLIP/projector/LLM 全部冻结，只更新 EvidenceLocalizer（约 0.9M 参数）。
+CLIP/projector/LLM 全部冻结，只更新 EvidenceLocalizer（约 0.87M 参数）。
 软掩码乘在投影后特征上，梯度经掩码回传到头；训练保持全部 576 token，
 硬剪枝只发生在推理（prune.py 管线）。
 
 用法（小规模先行）：
-  .venv/bin/python train_localizer.py --n 2000 --epochs 2 --out checkpoints/localizer_2k.pt
-  带蒸馏：先 scripts/calibrate_loc_heads.py 产 heads.json + teacher.pt，再
-  --heads heads.json --teacher teacher.pt --lambda-distill 1.0
+  .venv/bin/python train_localizer.py --n 2000 --epochs 2 --out checkpoints/localizer_emoset2k.pt
 """
 
 from __future__ import annotations
@@ -29,9 +27,6 @@ from tqdm import tqdm
 from emoscope.datasets import emoset_boxes
 from emoscope.llava import load_llava
 from emoscope.localizer import GRID, EvidenceLocalizer, patch_targets
-from emoscope.ttt import TTTMLPLocalizer
-from emoscope.prune import enable_layer_attention
-from emoscope.prune import _z as _zscore
 
 QUESTION = ("You are given an image and must infer its emotional category.\n"
             "Answer with one word from: amusement, anger, awe, contentment, "
@@ -45,26 +40,9 @@ def build_batch(model, processor, localizer, chunk, device):
                                    return_tensors="pt")["pixel_values"]
     px = px.to(device, torch.bfloat16)
     with torch.no_grad():
-        vis = model.model.vision_tower(
-            px, output_hidden_states=True,
-            output_attentions=(getattr(localizer, "use_cls", False)
-                               or getattr(localizer, "blend_alpha", None) is not None
-                               or getattr(localizer, "blend_gamma", None) is not None))
-        feats = vis.hidden_states[-2][:, 1:]                     # (B,576,1024)
-        cls_score = None
-        if (getattr(localizer, "use_cls", False) or getattr(localizer, "blend_alpha", None) is not None
-                or getattr(localizer, "blend_gamma", None) is not None):
-            # 融合/加权模式需要 CLS 分数（单层 eager 已开启）
-            a = next(a for a in vis.attentions if a is not None)
-            cls_score = a.mean(dim=1)[:, 0, 1:].float()          # (B,576)
-    s = localizer(feats.float(), cls_score if getattr(localizer, "use_cls", False) else None)
-    if getattr(localizer, "blend_alpha", None) is not None:
-        # [已归档] z 标准化加权：锁死预算，仅存档对照
-        s = localizer.blend_alpha * _zscore(s) \
-            + (1 - localizer.blend_alpha) * _zscore(cls_score)
-    elif getattr(localizer, "blend_gamma", None) is not None:
-        # 直接相加+可学习尺度：head 主导幅值，CLS 以 e^γ 缩放后作加性偏置
-        s = s + torch.exp(localizer.blend_gamma) * cls_score
+        feats = model.model.vision_tower(px, output_hidden_states=True)\
+                  .hidden_states[-2][:, 1:]                     # (B,576,1024)
+    s = localizer(feats.float())                                # 证据分数 logits
     m = torch.sigmoid(s)                                        # 软掩码
     with torch.no_grad():
         emb = model.model.multi_modal_projector(feats)          # (B,576,4096)
@@ -113,18 +91,6 @@ def main() -> None:
                     help="框外软负例权重（仅正例监督的折中）")
     ap.add_argument("--lambda-budget", type=float, default=1.0,
                     help="预算正则权重（损失已按576归一，量级与其他项相当）")
-    ap.add_argument("--heads", default=None, help="定位头标定结果 json（可选）")
-    ap.add_argument("--teacher", default=None,
-                    help="老师热图缓存 pt（可选，配合 --heads）")
-    ap.add_argument("--lambda-distill", type=float, default=0.0)
-    ap.add_argument("--use-cls", action="store_true",
-                    help="训练级融合：输入拼接 CLS 注意力分数")
-    ap.add_argument("--blend-alpha", action="store_true",
-                    help="[已归档] z标准化加权，预算死锁，勿用")
-    ap.add_argument("--blend-gamma", action="store_true",
-                    help="分数级融合：s = head + e^γ·cls（可学习尺度，预算自由）")
-    ap.add_argument("--ttt", action="store_true",
-                    help="用 TTT-MLP 头（逐图内环适应）替代静态 MLP 头")
     ap.add_argument("--out", default="checkpoints/localizer.pt")
     args = ap.parse_args()
 
@@ -132,31 +98,15 @@ def main() -> None:
     random.Random(0).shuffle(rows)
     train_rows, val_rows = rows[:args.n], rows[args.n:args.n + args.val]
 
-    teacher = torch.load(args.teacher) if args.teacher else None  # {path: (576,)}
-
     model, processor = load_llava()
     model.requires_grad_(False)
-    if args.use_cls or args.blend_alpha or args.blend_gamma:
-        enable_layer_attention(model)  # 融合/加权头训练需 CLS 注意力（单层 eager）
     device = model.device
-    if args.ttt:
-        localizer = TTTMLPLocalizer().to(device)
-        if args.use_cls or args.blend_alpha or args.blend_gamma:
-            raise SystemExit("--ttt 与融合选项互斥（G臂=纯TTT头对照）")
-    else:
-        localizer = EvidenceLocalizer(use_cls=args.use_cls).to(device)
-    blend_params = []
-    if args.blend_alpha:
-        localizer.blend_alpha = torch.nn.Parameter(torch.tensor(0.0, device=device))
-        blend_params.append(localizer.blend_alpha)
-    if args.blend_gamma:
-        localizer.blend_gamma = torch.nn.Parameter(torch.tensor(0.0, device=device))
-        blend_params.append(localizer.blend_gamma)
-    opt = torch.optim.AdamW(list(localizer.parameters()) + blend_params, lr=args.lr)
+    localizer = EvidenceLocalizer().to(device)
+    opt = torch.optim.AdamW(localizer.parameters(), lr=args.lr)
 
     def run_batches(data, train, epoch, log_f):
         localizer.train(train)
-        tot = {"ce": 0.0, "box": 0.0, "bud": 0.0, "kl": 0.0,
+        tot = {"ce": 0.0, "box": 0.0, "bud": 0.0,
                "gn": 0.0, "iou": 0.0, "kept": 0.0, "n": 0}
         pbar = tqdm(range(0, len(data), args.bs), desc="train" if train else "val")
         for i in pbar:
@@ -172,14 +122,7 @@ def main() -> None:
                      * w).mean()
             # 预算正则：软掩码总量拴在目标附近（按576归一，防压过其他损失）
             l_bud = ((m.sum(-1).mean() - args.k_target) / 576.0) ** 2
-            l_kl = torch.zeros((), device=device)
             total = out.loss + args.lambda_box * l_box + args.lambda_budget * l_bud
-
-            if teacher is not None:
-                q = torch.stack([teacher[r["path"]] for r in chunk]).to(device)
-                l_kl = (q * (q.clamp_min(1e-8).log()
-                             - F.log_softmax(s, dim=-1))).sum(-1).mean()
-                total = total + args.lambda_distill * l_kl
 
             grad_norm = 0.0
             if train:
@@ -198,7 +141,7 @@ def main() -> None:
                 top = s[b].topk(n_pos[b]).indices
                 hit += tgt[b][top].mean().item()
             tot["ce"] += out.loss.item(); tot["box"] += l_box.item()
-            tot["bud"] += l_bud.item(); tot["kl"] += l_kl.item()
+            tot["bud"] += l_bud.item()
             tot["gn"] += grad_norm; tot["iou"] += hit / len(chunk)
             tot["kept"] += m.sum(-1).mean().item(); tot["n"] += 1
             pbar.set_postfix(ce=f"{out.loss.item():.3f}",
@@ -208,27 +151,19 @@ def main() -> None:
                              iou=f"{hit / len(chunk):.3f}",
                              kept=f"{m.sum(-1).mean().item():.0f}")
             # 每批日志落在优化器更新步上（间隔=累积数的倍数），gn 行行有值
-            step = tot["n"]
-            if train and step % (args.accum * 2) == 0:
+            step_n = tot["n"]
+            if train and step_n % (args.accum * 2) == 0:
                 log_f.write(json.dumps({
-                    "phase": "train", "epoch": epoch, "step": step,
+                    "phase": "train", "epoch": epoch, "step": step_n,
                     "ce": round(out.loss.item(), 4), "box": round(l_box.item(), 4),
                     "bud": round(l_bud.item(), 5), "gn": round(grad_norm, 3),
                     "iou": round(hit / len(chunk), 3),
-                    "kept": round(m.sum(-1).mean().item(), 1),
-                    "alpha": (round(torch.sigmoid(localizer.blend_alpha).item(), 3)
-                              if getattr(localizer, "blend_alpha", None) is not None else None),
-                    "gamma": (round(torch.exp(localizer.blend_gamma).item(), 3)
-                              if getattr(localizer, "blend_gamma", None) is not None else None)}) + "\n")
+                    "kept": round(m.sum(-1).mean().item(), 1)}) + "\n")
                 log_f.flush()
         means = {k: v / tot["n"] for k, v in tot.items() if k != "n"}
         if not train:
             log_f.write(json.dumps({"phase": "val", "epoch": epoch,
-                                    **{k: round(v, 4) for k, v in means.items()},
-                                    "alpha": (round(torch.sigmoid(localizer.blend_alpha).item(), 3)
-                                              if getattr(localizer, "blend_alpha", None) is not None else None),
-                                    "gamma": (round(torch.exp(localizer.blend_gamma).item(), 3)
-                                              if getattr(localizer, "blend_gamma", None) is not None else None)})
+                                    **{k: round(v, 4) for k, v in means.items()}})
                         + "\n")
             log_f.flush()
         return means
@@ -241,20 +176,11 @@ def main() -> None:
             tr = run_batches(train_rows, train=True, epoch=ep, log_f=log_f)
             va = run_batches(val_rows, train=False, epoch=ep, log_f=log_f)
             print(f"epoch {ep}: train ce={tr['ce']:.4f} box={tr['box']:.4f} "
-                  f"bud={tr['bud']:.1f} kl={tr['kl']:.3f} gn={tr['gn']:.2f} "
+                  f"bud={tr['bud']:.1f} gn={tr['gn']:.2f} "
                   f"iou={tr['iou']:.3f} kept={tr['kept']:.0f}")
             print(f"          val   ce={va['ce']:.4f} box={va['box']:.4f} "
                   f"iou={va['iou']:.3f} kept={va['kept']:.0f}")
     torch.save(localizer.state_dict(), out_path)
-    meta = {}
-    if getattr(localizer, "blend_alpha", None) is not None:
-        meta["alpha"] = round(torch.sigmoid(localizer.blend_alpha).item(), 4)
-    if getattr(localizer, "blend_gamma", None) is not None:
-        meta["gamma"] = round(torch.exp(localizer.blend_gamma).item(), 4)
-        print(f"学到的 gamma（CLS 尺度）= {meta['gamma']:.4f}")
-    if meta:
-        Path(str(out_path).replace(".pt", ".alpha.json")).write_text(
-            json.dumps(meta, indent=2))
     print(f"checkpoint -> {out_path}")
     print(f"训练日志   -> {log_path}")
 
