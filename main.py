@@ -22,7 +22,7 @@ from PIL import Image
 from tqdm import tqdm
 
 from emoscope.llava import load_llava
-from emoscope.prune import enable_vision_attention, generate_pruned
+from emoscope.prune import enable_layer_attention, generate_pruned
 from emoscope.datasets import artemis, artphoto, emotion6, emoset, fi
 
 # 各数据集的标签空间（Emotion6 为 6 类，其余为 EmoSet 8 类）
@@ -70,7 +70,7 @@ def run_dataset(model, processor, name: str, limit: int | None, bs: int,
     question = classify_prompt(labels)
     prompt = f"USER: <image>\n{question} ASSISTANT:"
     if keep and localizer is None and not random:
-        enable_vision_attention(model)  # 仅 CLS 打分需注意力；定位头/随机不需要
+        enable_layer_attention(model)  # CLS 打分：仅倒数第二层 eager，其余层保持 sdpa
 
     # 断点续跑：读已有记录跳过完成样本，结果逐批追加落盘（中断后重跑不重来）
     out_dir = Path(__file__).parent / "results" / model_name

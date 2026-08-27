@@ -11,23 +11,40 @@ sdpa 后端不返回注意力权重，视觉塔须切 eager（LLM 仍为 sdpa）
 
 from __future__ import annotations
 
+import copy
+
 import torch
 
 
 def enable_vision_attention(model) -> None:
-    """视觉塔切 eager，使其 forward 能返回注意力权重。"""
+    """整塔切 eager（旧法）：只为取一层注意力付出全塔代价，仅作对照保留。"""
     model.model.vision_tower.set_attn_implementation("eager")
+
+
+def enable_layer_attention(model, layer_idx: int = 22) -> None:
+    """仅倒数第二层切 eager，其余 23 层保持 sdpa。
+
+    5.x 的 CLIPAttention 每次前向动态读 self_attn.config._attn_implementation，
+    故单层替换副本即可；该层返回的注意力是 attentions 里唯一非空项。
+    """
+    attn = model.model.vision_tower.encoder.layers[layer_idx].self_attn
+    attn.config = copy.deepcopy(attn.config)
+    attn.config._attn_implementation = "eager"
 
 
 def vision_feats_scores(model, pixel_values) -> tuple[torch.Tensor, torch.Tensor]:
     """视觉塔一次前向，返回 (投影前 patch 特征, 每个 patch 的重要性)。
 
     特征取倒数第二层；重要性 = 同层注意力按头平均后的 [CLS] 行（丢 CLS 列）。
+    兼容两种模式：整塔 eager（attentions 全满，取 [-2]）与单层 eager
+    （只有一项非空，取该项）。
     """
     vis = model.model.vision_tower(pixel_values, output_hidden_states=True,
                                    output_attentions=True)
     feats = vis.hidden_states[-2][:, 1:]                  # (B,576,1024)
-    scores = vis.attentions[-2].mean(dim=1)[:, 0, 1:]     # (B,576)
+    attns = [a for a in vis.attentions if a is not None]
+    a = attns[0] if len(attns) == 1 else vis.attentions[-2]
+    scores = a.mean(dim=1)[:, 0, 1:]                      # (B,576)
     return feats, scores
 
 
