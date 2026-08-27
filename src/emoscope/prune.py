@@ -87,7 +87,16 @@ def generate_pruned(model, processor, images: list, prompt: str, keep_pct: float
         s_head = localizer(feats.float())
         scores = ensemble_alpha * _z(s_head) + (1 - ensemble_alpha) * _z(s_cls)
     elif localizer is not None:
-        if getattr(localizer, "blend_alpha", None) is not None:
+        if getattr(localizer, "blend_gamma", None) is not None:
+            # 直接相加推理：head + e^γ·cls（γ 取训练学到的尺度）
+            vis = model.model.vision_tower(px, output_hidden_states=True,
+                                           output_attentions=True)
+            feats = vis.hidden_states[-2][:, 1:]
+            a = next(a for a in vis.attentions if a is not None)
+            s_cls = a.mean(dim=1)[:, 0, 1:].float()
+            s_head = localizer(feats.float())
+            scores = s_head + float(localizer.blend_gamma) * s_cls
+        elif getattr(localizer, "blend_alpha", None) is not None:
             # 分数级加权推理：alpha 取训练学到的系数（标量）
             vis = model.model.vision_tower(px, output_hidden_states=True,
                                            output_attentions=True)

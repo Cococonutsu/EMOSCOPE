@@ -178,7 +178,7 @@ def main() -> None:
     ap.add_argument("--cls-feat", action="store_true",
                     help="定位头为融合版（输入含 CLS 特征），加载与推理时启用")
     ap.add_argument("--blend-head", action="store_true",
-                    help="定位头为分数级加权版：推理时按 checkpoint 里的 alpha 与CLS混合")
+                    help="定位头为分数级融合版：按 checkpoint 元信息（alpha/gamma）与CLS混合")
     ap.add_argument("--seed", type=int, default=0,
                     help="random 打分器的抽样种子（多seed检验方差用）")
     args = ap.parse_args()
@@ -200,11 +200,14 @@ def main() -> None:
         localizer.eval()
         if args.blend_head:
             import json as _json
-            alpha = _json.load(open(str(args.localizer)
-                                    .replace(".pt", ".alpha.json")))["alpha"]
-            import math
-            localizer.blend_alpha = alpha  # 推理用学到的系数
-            print(f"blend-head: alpha={alpha}（头权重，CLS 为 1-alpha）")
+            meta = _json.load(open(str(args.localizer)
+                                   .replace(".pt", ".alpha.json")))
+            if "gamma" in meta:
+                localizer.blend_gamma = meta["gamma"]
+                print(f"blend-head: gamma={meta['gamma']}（CLS 尺度，直接相加）")
+            else:
+                localizer.blend_alpha = meta["alpha"]
+                print(f"blend-head: alpha={meta['alpha']}（头权重）[已归档]")
     model_name = args.model_name
     if args.keep and args.model_name == "llava1.5-base":  # 剪枝结果另存目录
         ckpt = Path(args.localizer).stem.removeprefix("localizer_") if args.localizer else ""
