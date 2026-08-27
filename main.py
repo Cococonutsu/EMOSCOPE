@@ -71,7 +71,8 @@ def run_dataset(model, processor, name: str, limit: int | None, bs: int,
     question = classify_prompt(labels)
     prompt = f"USER: <image>\n{question} ASSISTANT:"
     if keep and ((localizer is None and not random) or ensemble_alpha is not None
-                 or (localizer is not None and getattr(localizer, "use_cls", False))):
+                 or (localizer is not None and (getattr(localizer, "use_cls", False)
+                     or getattr(localizer, "blend_alpha", None) is not None))):
         enable_layer_attention(model)  # CLS 参与打分时取注意力；纯头/随机不需要
 
     # 断点续跑：读已有记录跳过完成样本，结果逐批追加落盘（中断后重跑不重来）
@@ -176,6 +177,8 @@ def main() -> None:
                     help="ensemble 中定位头的权重（CLS 为 1-alpha）")
     ap.add_argument("--cls-feat", action="store_true",
                     help="定位头为融合版（输入含 CLS 特征），加载与推理时启用")
+    ap.add_argument("--blend-head", action="store_true",
+                    help="定位头为分数级加权版：推理时按 checkpoint 里的 alpha 与CLS混合")
     ap.add_argument("--seed", type=int, default=0,
                     help="random 打分器的抽样种子（多seed检验方差用）")
     args = ap.parse_args()
@@ -191,9 +194,16 @@ def main() -> None:
     if args.localizer:
         from emoscope.localizer import EvidenceLocalizer
         localizer = EvidenceLocalizer(use_cls=args.cls_feat).to(model.device)
-        localizer.load_state_dict(torch.load(args.localizer,
-                                             map_location=model.device))
+        state = torch.load(args.localizer, map_location=model.device)
+        localizer.load_state_dict(state)
         localizer.eval()
+        if args.blend_head:
+            import json as _json
+            alpha = _json.load(open(str(args.localizer)
+                                    .replace(".pt", ".alpha.json")))["alpha"]
+            import math
+            localizer.blend_alpha = alpha  # 推理用学到的系数
+            print(f"blend-head: alpha={alpha}（头权重，CLS 为 1-alpha）")
     model_name = args.model_name
     if args.keep and args.model_name == "llava1.5-base":  # 剪枝结果另存目录
         ckpt = Path(args.localizer).stem.removeprefix("localizer_") if args.localizer else ""

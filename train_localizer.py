@@ -30,6 +30,7 @@ from emoscope.datasets import emoset_boxes
 from emoscope.llava import load_llava
 from emoscope.localizer import GRID, EvidenceLocalizer, patch_targets
 from emoscope.prune import enable_layer_attention
+from emoscope.prune import _z as _zscore
 
 QUESTION = ("You are given an image and must infer its emotional category.\n"
             "Answer with one word from: amusement, anger, awe, contentment, "
@@ -43,14 +44,21 @@ def build_batch(model, processor, localizer, chunk, device):
                                    return_tensors="pt")["pixel_values"]
     px = px.to(device, torch.bfloat16)
     with torch.no_grad():
-        vis = model.model.vision_tower(px, output_hidden_states=True,
-                                       output_attentions=localizer.use_cls)
+        vis = model.model.vision_tower(
+            px, output_hidden_states=True,
+            output_attentions=(localizer.use_cls
+                               or getattr(localizer, "blend_alpha", None) is not None))
         feats = vis.hidden_states[-2][:, 1:]                     # (B,576,1024)
         cls_score = None
-        if localizer.use_cls:  # 融合头需要 CLS 特征（单层 eager 已开启）
+        if localizer.use_cls or getattr(localizer, "blend_alpha", None) is not None:
+            # 融合/加权模式需要 CLS 分数（单层 eager 已开启）
             a = next(a for a in vis.attentions if a is not None)
             cls_score = a.mean(dim=1)[:, 0, 1:].float()          # (B,576)
-    s = localizer(feats.float(), cls_score)                      # 证据分数 logits
+    s = localizer(feats.float(), cls_score if localizer.use_cls else None)
+    if getattr(localizer, "blend_alpha", None) is not None:
+        # 分数级可学习加权（与推理集成同构）：s = a*z(头) + (1-a)*z(CLS)
+        s = localizer.blend_alpha * _zscore(s) \
+            + (1 - localizer.blend_alpha) * _zscore(cls_score)
     m = torch.sigmoid(s)                                        # 软掩码
     with torch.no_grad():
         emb = model.model.multi_modal_projector(feats)          # (B,576,4096)
@@ -105,6 +113,8 @@ def main() -> None:
     ap.add_argument("--lambda-distill", type=float, default=0.0)
     ap.add_argument("--use-cls", action="store_true",
                     help="训练级融合：输入拼接 CLS 注意力分数")
+    ap.add_argument("--blend-alpha", action="store_true",
+                    help="分数级融合：头分数与CLS标准化后按可学习alpha加权")
     ap.add_argument("--out", default="checkpoints/localizer.pt")
     args = ap.parse_args()
 
@@ -116,11 +126,17 @@ def main() -> None:
 
     model, processor = load_llava()
     model.requires_grad_(False)
-    if args.use_cls:
-        enable_layer_attention(model)  # 融合头训练需 CLS 注意力（单层 eager）
+    if args.use_cls or args.blend_alpha:
+        enable_layer_attention(model)  # 融合/加权头训练需 CLS 注意力（单层 eager）
     device = model.device
     localizer = EvidenceLocalizer(use_cls=args.use_cls).to(device)
-    opt = torch.optim.AdamW(localizer.parameters(), lr=args.lr)
+    if args.blend_alpha:
+        # 可学习混合系数，sigmoid 域参数化保证 (0,1)；初值 0.5
+        localizer.blend_alpha = torch.nn.Parameter(torch.tensor(0.0, device=device))
+        opt = torch.optim.AdamW(list(localizer.parameters())
+                                + [localizer.blend_alpha], lr=args.lr)
+    else:
+        opt = torch.optim.AdamW(localizer.parameters(), lr=args.lr)
 
     def run_batches(data, train, epoch, log_f):
         localizer.train(train)
@@ -183,12 +199,18 @@ def main() -> None:
                     "ce": round(out.loss.item(), 4), "box": round(l_box.item(), 4),
                     "bud": round(l_bud.item(), 5), "gn": round(grad_norm, 3),
                     "iou": round(hit / len(chunk), 3),
-                    "kept": round(m.sum(-1).mean().item(), 1)}) + "\n")
+                    "kept": round(m.sum(-1).mean().item(), 1),
+                    "alpha": (round(torch.sigmoid(localizer.blend_alpha).item(), 3)
+                              if getattr(localizer, "blend_alpha", None) is not None
+                              else None)}) + "\n")
                 log_f.flush()
         means = {k: v / tot["n"] for k, v in tot.items() if k != "n"}
         if not train:
             log_f.write(json.dumps({"phase": "val", "epoch": epoch,
-                                    **{k: round(v, 4) for k, v in means.items()}})
+                                    **{k: round(v, 4) for k, v in means.items()},
+                                    "alpha": (round(torch.sigmoid(localizer.blend_alpha).item(), 3)
+                                              if getattr(localizer, "blend_alpha", None) is not None
+                                              else None)})
                         + "\n")
             log_f.flush()
         return means
@@ -206,6 +228,11 @@ def main() -> None:
             print(f"          val   ce={va['ce']:.4f} box={va['box']:.4f} "
                   f"iou={va['iou']:.3f} kept={va['kept']:.0f}")
     torch.save(localizer.state_dict(), out_path)
+    if getattr(localizer, "blend_alpha", None) is not None:
+        alpha = torch.sigmoid(localizer.blend_alpha).item()
+        Path(str(out_path).replace(".pt", ".alpha.json")).write_text(
+            json.dumps({"alpha": round(alpha, 4)}, indent=2))
+        print(f"学到的 alpha = {alpha:.4f}（头权重）")
     print(f"checkpoint -> {out_path}")
     print(f"训练日志   -> {log_path}")
 
