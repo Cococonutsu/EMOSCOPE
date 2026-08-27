@@ -24,13 +24,22 @@ import torch.nn.functional as F
 from PIL import Image
 from tqdm import tqdm
 
-from emoscope.datasets import emoset_boxes
 from emoscope.llava import load_llava
-from emoscope.localizer import GRID, EvidenceLocalizer, patch_targets
+from emoscope.localizer import GRID, EvidenceLocalizer
 
-QUESTION = ("You are given an image and must infer its emotional category.\n"
-            "Answer with one word from: amusement, anger, awe, contentment, "
-            "disgust, excitement, fear, sadness.")  # 与 emoset 测试集同款指令
+DATA_DIR = Path(__file__).resolve().parent / "dataset"
+# 与各测试集评测同款指令（混域训练按样本所属标签空间逐条选用）
+QUESTIONS = {
+    "emoset8": ("You are given an image and must infer its emotional category.\n"
+                "Answer with one word from: amusement, anger, awe, contentment, "
+                "disgust, excitement, fear, sadness."),
+    "e6_6": ("You are given an image and must infer its emotional category.\n"
+             "Answer with one word from: anger, disgust, fear, joy, sadness, surprise."),
+}
+
+
+def load_jsonl(path):
+    return [json.loads(line) for line in open(path, encoding="utf-8")]
 
 
 def build_batch(model, processor, localizer, chunk, device):
@@ -51,7 +60,8 @@ def build_batch(model, processor, localizer, chunk, device):
     # 文本：单 <image> 编码，视觉嵌入替换它；答案 token 位置算 CE
     tok = processor.tokenizer
     tok.padding_side = "right"  # 左填充会移动 <image> 位置并破坏标签对齐
-    texts = [f"USER: <image>\n{QUESTION} ASSISTANT: {r['label']}" for r in chunk]
+    texts = [f"USER: <image>\n{QUESTIONS[r['qset']]} ASSISTANT: {r['label']}"
+             for r in chunk]
     enc = tok(texts, return_tensors="pt", padding=True)
     ids, text_am = enc.input_ids.to(device), enc.attention_mask.to(device)
     word = model.model.language_model.embed_tokens(ids).detach()
@@ -59,20 +69,23 @@ def build_batch(model, processor, localizer, chunk, device):
     embeds = torch.cat([word[:, :img_col], emb, word[:, img_col + 1:]], 1)
     am = torch.cat([text_am[:, :img_col], text_am.new_ones(len(chunk), GRID * GRID),
                     text_am[:, img_col + 1:]], 1)
-    # 只监督答案 token：prompt 部分按无答案版本长度截掉（须满足前缀性质）
-    prompt_ids = tok(f"USER: <image>\n{QUESTION} ASSISTANT:").input_ids
-    n_prompt = len(prompt_ids)
-    assert all(ids[b, :n_prompt].tolist() == prompt_ids for b in range(len(chunk)))
-    pos = torch.arange(ids.shape[1], device=device)[None, :]
-    text_labels = ids.masked_fill((pos < n_prompt) | (text_am == 0), -100)
+    # 只监督答案 token：prompt 部分按无答案版本长度截掉（逐样本所属模板）
+    prompt_ids = {q: tok(f"USER: <image>\n{QUESTIONS[q]} ASSISTANT:").input_ids
+                  for q in {r["qset"] for r in chunk}}
+    for b, r in enumerate(chunk):
+        p = prompt_ids[r["qset"]]
+        assert ids[b, :len(p)].tolist() == p
+    n_prompt = torch.tensor([len(prompt_ids[r["qset"]]) for r in chunk],
+                            device=device)[None, :]                 # (1,B)
+    pos = torch.arange(ids.shape[1], device=device)[None, :]        # (1,L)
+    text_labels = ids.masked_fill((pos < n_prompt.T) | (text_am == 0), -100)
     # 标签与嵌入同步拼接：视觉段全 -100，只留答案 token
     labels = torch.cat([text_labels[:, :img_col],
                         text_labels.new_full((len(chunk), GRID * GRID), -100),
                         text_labels[:, img_col + 1:]], 1)
 
-    # 框 -> patch 0/1 目标（B,576）
-    tgt = torch.stack([patch_targets(r["boxes"], im.width, im.height)
-                       for r, im in zip(chunk, images)])
+    # 证据 patch 目标直接取自数据集记录（构建时已统一换算成网格）
+    tgt = torch.tensor([[float(v) for v in r["target"]] for r in chunk])
     return embeds, am, labels, s, m, tgt.to(device)
 
 
@@ -91,12 +104,20 @@ def main() -> None:
                     help="框外软负例权重（仅正例监督的折中）")
     ap.add_argument("--lambda-budget", type=float, default=1.0,
                     help="预算正则权重（损失已按576归一，量级与其他项相当）")
+    ap.add_argument("--mix", action="store_true",
+                    help="混域：加入 ArtEmis(画作式) + EmotionROI(人脸式) 标注数据")
     ap.add_argument("--out", default="checkpoints/localizer.pt")
     args = ap.parse_args()
 
-    rows = emoset_boxes.load(limit=args.n + args.val)
-    random.Random(0).shuffle(rows)
-    train_rows, val_rows = rows[:args.n], rows[args.n:args.n + args.val]
+    train_rows = load_jsonl(DATA_DIR / "train_emoset.jsonl")[:args.n]
+    val_rows = load_jsonl(DATA_DIR / "val_emoset.jsonl")[:args.val]
+    extra = []
+    if args.mix:
+        for name in ("train_artemis.jsonl", "train_emotionroi.jsonl"):
+            extra += load_jsonl(DATA_DIR / name)
+        random.Random(1).shuffle(extra)
+        train_rows = train_rows + extra  # 混域交错，固定种子可复现
+    print(f"训练 {len(train_rows)} 条（emoset {args.n} + 混域 {len(extra)}）")
 
     model, processor = load_llava()
     model.requires_grad_(False)
