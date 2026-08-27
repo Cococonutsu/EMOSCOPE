@@ -104,16 +104,10 @@ def main() -> None:
                     help="框外软负例权重（仅正例监督的折中）")
     ap.add_argument("--lambda-budget", type=float, default=1.0,
                     help="预算正则权重（损失已按576归一，量级与其他项相当）")
-    ap.add_argument("--mix", action="store_true",
-                    help="混域：加入 ArtEmis(画作式) + EmotionROI(人脸式) 标注数据")
     ap.add_argument("--out", default="checkpoints/localizer.pt")
     args = ap.parse_args()
 
-    if args.mix:
-        train_rows = load_jsonl(DATA_DIR / "train_mix.jsonl")  # 全量，--n 仅用于emoset单源路径
-        print(f"训练 {len(train_rows)} 条（三源已合并打乱：dataset/train_mix.jsonl）")
-    else:
-        train_rows = load_jsonl(DATA_DIR / "train_emoset.jsonl")[:args.n]
+    train_rows = load_jsonl(DATA_DIR / "train_emoset.jsonl")[:args.n]
     val_rows = load_jsonl(DATA_DIR / "val_emoset.jsonl")[:args.val]
 
     model, processor = load_llava()
