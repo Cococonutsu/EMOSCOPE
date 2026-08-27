@@ -175,6 +175,8 @@ def main() -> None:
                     help="ensemble 中定位头的权重（CLS 为 1-alpha）")
     ap.add_argument("--cls-feat", action="store_true",
                     help="定位头为融合版（输入含 CLS 特征），加载与推理时启用")
+    ap.add_argument("--ttt", action="store_true",
+                    help="定位头为 TTT-MLP 版（逐图内环适应）")
     ap.add_argument("--blend-head", action="store_true",
                     help="定位头为分数级融合版：按 checkpoint 元信息（alpha/gamma）与CLS混合")
     ap.add_argument("--seed", type=int, default=0,
@@ -191,7 +193,11 @@ def main() -> None:
     localizer = None
     if args.localizer:
         from emoscope.localizer import EvidenceLocalizer
-        localizer = EvidenceLocalizer(use_cls=args.cls_feat).to(model.device)
+        if args.ttt:
+            from emoscope.ttt import TTTMLPLocalizer
+            localizer = TTTMLPLocalizer().to(model.device)
+        else:
+            localizer = EvidenceLocalizer(use_cls=args.cls_feat).to(model.device)
         state = torch.load(args.localizer, map_location=model.device)
         # blend 参数（alpha/gamma）单独存于 .alpha.json 元信息，不属模型权重
         for k in [k for k in state if k.startswith("blend_")]:

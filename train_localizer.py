@@ -29,6 +29,7 @@ from tqdm import tqdm
 from emoscope.datasets import emoset_boxes
 from emoscope.llava import load_llava
 from emoscope.localizer import GRID, EvidenceLocalizer, patch_targets
+from emoscope.ttt import TTTMLPLocalizer
 from emoscope.prune import enable_layer_attention
 from emoscope.prune import _z as _zscore
 
@@ -46,17 +47,17 @@ def build_batch(model, processor, localizer, chunk, device):
     with torch.no_grad():
         vis = model.model.vision_tower(
             px, output_hidden_states=True,
-            output_attentions=(localizer.use_cls
+            output_attentions=(getattr(localizer, "use_cls", False)
                                or getattr(localizer, "blend_alpha", None) is not None
                                or getattr(localizer, "blend_gamma", None) is not None))
         feats = vis.hidden_states[-2][:, 1:]                     # (B,576,1024)
         cls_score = None
-        if (localizer.use_cls or getattr(localizer, "blend_alpha", None) is not None
+        if (getattr(localizer, "use_cls", False) or getattr(localizer, "blend_alpha", None) is not None
                 or getattr(localizer, "blend_gamma", None) is not None):
             # 融合/加权模式需要 CLS 分数（单层 eager 已开启）
             a = next(a for a in vis.attentions if a is not None)
             cls_score = a.mean(dim=1)[:, 0, 1:].float()          # (B,576)
-    s = localizer(feats.float(), cls_score if localizer.use_cls else None)
+    s = localizer(feats.float(), cls_score if getattr(localizer, "use_cls", False) else None)
     if getattr(localizer, "blend_alpha", None) is not None:
         # [已归档] z 标准化加权：锁死预算，仅存档对照
         s = localizer.blend_alpha * _zscore(s) \
@@ -122,6 +123,8 @@ def main() -> None:
                     help="[已归档] z标准化加权，预算死锁，勿用")
     ap.add_argument("--blend-gamma", action="store_true",
                     help="分数级融合：s = head + e^γ·cls（可学习尺度，预算自由）")
+    ap.add_argument("--ttt", action="store_true",
+                    help="用 TTT-MLP 头（逐图内环适应）替代静态 MLP 头")
     ap.add_argument("--out", default="checkpoints/localizer.pt")
     args = ap.parse_args()
 
@@ -136,7 +139,12 @@ def main() -> None:
     if args.use_cls or args.blend_alpha or args.blend_gamma:
         enable_layer_attention(model)  # 融合/加权头训练需 CLS 注意力（单层 eager）
     device = model.device
-    localizer = EvidenceLocalizer(use_cls=args.use_cls).to(device)
+    if args.ttt:
+        localizer = TTTMLPLocalizer().to(device)
+        if args.use_cls or args.blend_alpha or args.blend_gamma:
+            raise SystemExit("--ttt 与融合选项互斥（G臂=纯TTT头对照）")
+    else:
+        localizer = EvidenceLocalizer(use_cls=args.use_cls).to(device)
     blend_params = []
     if args.blend_alpha:
         localizer.blend_alpha = torch.nn.Parameter(torch.tensor(0.0, device=device))
