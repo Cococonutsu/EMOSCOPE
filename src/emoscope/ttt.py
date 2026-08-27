@@ -21,6 +21,13 @@ import torch.nn.functional as F
 TTT_BASE_LR = 1.0  # 官方 TTTConfig.ttt_base_lr 默认值
 
 
+def _gelu_bwd(x):
+    """tanh 近似 gelu 的导数（官方 ttt.py::gelu_bwd 逐系数同款）。"""
+    tanh_out = torch.tanh(0.79788456 * x * (1 + 0.044715 * x * x))
+    return 0.5 * x * ((1 - tanh_out * tanh_out)
+                      * (0.79788456 + 0.1070322243 * x * x)) + 0.5 * (1 + tanh_out)
+
+
 def _ln_fwd(x, gamma, beta, eps=1e-6):
     mu = x.mean(dim=-1, keepdim=True)
     std = torch.sqrt(x.var(dim=-1, keepdim=True, unbiased=False) + eps)
@@ -48,7 +55,8 @@ class TTTMLPLocalizer(nn.Module):
     def __init__(self, in_dim: int = 1024, hidden: int = 128,
                  expand: int = 4, num_heads: int = 4, mini_batch: int = 16):
         super().__init__()
-        assert hidden % num_heads == 0 and 576 % mini_batch == 0
+        assert hidden % num_heads == 0
+        self.n_patches = None  # 首次 forward 时按输入长度建位置编码
         self.width = hidden
         self.num_heads = num_heads
         self.head_dim = hidden // num_heads
@@ -61,11 +69,13 @@ class TTTMLPLocalizer(nn.Module):
         self.b1 = nn.Parameter(torch.zeros(num_heads, 1, f))
         self.W2 = nn.Parameter(torch.normal(0, 0.02, (num_heads, f, self.head_dim)))
         self.b2 = nn.Parameter(torch.zeros(num_heads, 1, self.head_dim))
-        # 官方 learnable_ttt_lr：[H, d, 1] 权重 + [H, 1, 1] 偏置
+        # 官方 learnable_ttt_lr（官方源码 _init_ttt_lr_gate 实测形状）：
+        #   weight = stack(Linear(width,1).weight) -> [H, 1, width]
+        #   bias   = stack(Linear(width,1).bias)   -> [H, 1]
         self.learnable_ttt_lr_weight = nn.Parameter(
-            torch.normal(0, 0.02, (num_heads, self.head_dim, 1)))
+            torch.normal(0, 0.02, (num_heads, 1, hidden)))
         self.learnable_ttt_lr_bias = nn.Parameter(
-            torch.zeros(num_heads, 1, 1))
+            torch.zeros(num_heads, 1))
         # 官方 token_idx（1/i 递减）与可学习修正
         self.register_buffer(
             "token_idx", 1.0 / torch.arange(1, mini_batch + 1), persistent=False)
@@ -76,24 +86,32 @@ class TTTMLPLocalizer(nn.Module):
         self.post_norm = nn.LayerNorm(hidden, eps=1e-6)
         self.o_proj = nn.Linear(hidden, hidden, bias=False)
         self.out_head = nn.Linear(hidden, 1, bias=True)
-        # 场景性位置编码（官方无，patch 打分需要绝对位置先验）
+        # 场景性位置编码（官方无，patch 打分需要绝对位置先验）。
+        # 必须在构造时创建：优化器先于首次前向构建，惰性创建会漏出参数表，
+        # 导致 pos 永远冻结在随机初始化上。
         self.pos = nn.Parameter(torch.zeros(1, 576, in_dim))
         nn.init.trunc_normal_(self.pos, std=0.02)
 
-    def _get_eta(self, x_mb: torch.Tensor, offset: int) -> tuple[torch.Tensor, torch.Tensor]:
-        """官方 get_eta：token_eta(1/i) * ttt_lr_eta(base_lr/d * sigmoid门控)。"""
-        b, h, k, d = x_mb.shape
+    def _get_eta(self, x_mb: torch.Tensor, offset: int) -> torch.Tensor:
+        """官方 get_eta 同构：返回 eta (B,H,K,width)。
+
+        ttt_lr = sigmoid(einsum) -> (B,H,K,width)；token_eta = 1/i (B,H,K,1)；
+        官方实测 eta = token_eta * ttt_lr_eta 形状 (B,H,nmb,K,K)。
+        tril(eta) 在最后两维 (K,width) 上做下三角（width≥K 时等效前 K 列），
+        (eta*Attn1)@G1: (B,H,K,width)@(B,H,K,head_dim) -> (B,H,K,head_dim)。
+        """
         ttt_lr = torch.sigmoid(
-            torch.einsum("bhkd,hdc->bhk", x_mb, self.learnable_ttt_lr_weight)
-            + self.learnable_ttt_lr_bias.reshape(1, -1, 1))          # (B,H,K)
-        ttt_lr_eta = TTT_BASE_LR * ttt_lr / self.head_dim
-        token_idx = (self.token_idx + self.learnable_token_idx)[offset:offset + k]
+            torch.einsum("bkc,hoc->bhko", x_mb, self.learnable_ttt_lr_weight)
+            + self.learnable_ttt_lr_bias.reshape(1, -1, 1, 1))       # (B,H,K,1)
+        ttt_lr_eta = TTT_BASE_LR * ttt_lr.permute(0, 1, 3, 2) / self.head_dim  # (B,H,1,K) 列门控
+        token_idx = (self.token_idx + self.learnable_token_idx)[:x_mb.shape[1]]
         token_idx = token_idx.clamp_min(0.0)
-        token_eta = token_idx.reshape(1, 1, k, 1).expand(b, h, k, 1)
-        return token_eta, ttt_lr_eta.unsqueeze(-1)                   # (B,H,K,1)
+        token_eta = token_idx.reshape(1, 1, x_mb.shape[1], 1)
+        return token_eta * ttt_lr_eta                                # (B,H,K,K)
 
     def forward(self, feats: torch.Tensor,
                 cls_score: torch.Tensor | None = None) -> torch.Tensor:
+        assert feats.shape[1] == self.pos.shape[1], "TTT头固定576 patch输入"
         x = self.in_proj(feats + self.pos)                           # (B,N,hid)
         b, n, _ = x.shape
         xh = x.view(b, n, self.num_heads, self.head_dim).transpose(1, 2)
@@ -114,8 +132,7 @@ class TTTMLPLocalizer(nn.Module):
         for s in range(0, n, self.mini_batch):
             e = min(s + self.mini_batch, n)
             xq = xk = xv = xh[:, :, s:e]                             # 场景性裁剪: XK=XV=XQ
-            token_eta, ttt_lr_eta = self._get_eta(xk, s % self.mini_batch)
-            eta = token_eta * ttt_lr_eta                             # (B,H,K,1)
+            eta = self._get_eta(x[:, s:e, :], s % self.mini_batch)  # (B,H,K,K)
             k = e - s
 
             # ---- 官方 dual form（use_dual_form=True 分支）逐行对应 ----
@@ -128,14 +145,14 @@ class TTTMLPLocalizer(nn.Module):
             reconstruction_target = xv - xk
             G2 = _ln_fused_l2_bwd(Z2, reconstruction_target,
                                   self.ttt_norm_weight, self.ttt_norm_bias)
-            G1 = G2 @ W2_init.transpose(-2, -1) * F.gelu(Z1, approximate="tanh")
+            G1 = G2 @ W2_init.transpose(-2, -1) * _gelu_bwd(Z1)  # 链式法则用导数
 
             Attn1 = torch.tril(xq @ X1.transpose(-2, -1))            # (B,H,K,K)
-            b1_bar = b1_init - (eta * torch.tril(eta.new_ones(k, k))) @ G1
+            b1_bar = b1_init - torch.tril(eta) @ G1
             Z1_bar = xq @ W1_init - (eta * Attn1) @ G1 + b1_bar
             X2_bar = F.gelu(Z1_bar, approximate="tanh")
             Attn2 = torch.tril(X2_bar @ X2.transpose(-2, -1))
-            b2_bar = b2_init - (eta * torch.tril(eta.new_ones(k, k))) @ G2
+            b2_bar = b2_init - torch.tril(eta) @ G2
             Z2_bar = X2_bar @ W2_init - (eta * Attn2) @ G2 + b2_bar
 
             eta_last = eta[:, :, -1, :, None]                        # (B,H,1,1)
