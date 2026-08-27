@@ -48,6 +48,18 @@ def vision_feats_scores(model, pixel_values) -> tuple[torch.Tensor, torch.Tensor
     return feats, scores
 
 
+def needs_attention(localizer, random: bool, ensemble_alpha) -> bool:
+    """本次推理是否需要取视觉塔注意力（CLS 参与打分的所有情形）。"""
+    if random:
+        return False
+    if localizer is None:
+        return True  # 默认 CLS 打分
+    return (getattr(localizer, "use_cls", False)
+            or getattr(localizer, "blend_alpha", None) is not None
+            or getattr(localizer, "blend_gamma", None) is not None
+            or ensemble_alpha is not None)
+
+
 def _z(s: torch.Tensor) -> torch.Tensor:
     """图内标准化：头 logits 与 CLS 注意力（和为1）尺度对齐后才能加权。"""
     return (s - s.mean(-1, keepdim=True)) / (s.std(-1, keepdim=True) + 1e-6)
