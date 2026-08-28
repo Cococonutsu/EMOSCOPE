@@ -23,7 +23,7 @@ from tqdm import tqdm
 
 from emoscope.llava import load_llava
 from emoscope.prune import enable_layer_attention, generate_pruned, needs_attention
-from emoscope.datasets import artemis, artphoto, emotion6, emoset, fi
+from emoscope.datasets import artemis, artphoto, emotion6, emoset, fi, vecbench
 
 # 各数据集的标签空间（Emotion6 为 6 类，其余为 EmoSet 8 类）
 LABEL_SETS = {
@@ -37,8 +37,10 @@ LABEL_SETS = {
                  "disgust", "excitement", "fear", "sadness"],
     "emotion6": ["anger", "disgust", "fear", "joy", "sadness", "surprise"],
 }
+LABEL_SETS.update({k: v for k, v in vecbench.LABEL_SETS.items()})
 DATASET_LOADERS = {"artphoto": artphoto, "emotion6": emotion6, "fi": fi,
-                    "emoset": emoset, "artemis": artemis}
+                    "emoset": emoset, "artemis": artemis,
+                    "unbiasedemo": vecbench, "webemo25": vecbench}
 
 
 def classify_prompt(labels: list[str]) -> str:
@@ -65,7 +67,8 @@ def run_dataset(model, processor, name: str, limit: int | None, bs: int,
                  localizer=None, random: bool = False,
                  ensemble_alpha: float | None = None) -> None:
     labels = LABEL_SETS[name]
-    rows = DATASET_LOADERS[name].load()
+    loader = DATASET_LOADERS[name]
+    rows = loader.load(name) if loader is vecbench else loader.load()
     if limit:
         rows = rows[:limit]
     question = classify_prompt(labels)
